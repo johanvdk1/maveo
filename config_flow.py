@@ -1,11 +1,13 @@
-"""Config flow for nymea integration."""
+"""Config flow for maveo integration."""
 
 from __future__ import annotations
 
 import logging
 import re
 from typing import Any
+import xml.etree.ElementTree as ET
 
+import aiohttp
 from homeassistant import config_entries, exceptions
 from homeassistant.components import zeroconf
 from homeassistant.config_entries import ConfigFlowResult
@@ -18,51 +20,21 @@ from .maveo_box import MaveoBox
 
 _LOGGER = logging.getLogger(__name__)
 
-DATA_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_HOST, default="192.168.2.179"): str,
-        vol.Required(CONF_PORT, default=2222): int,  # JSON-RPC port for commands and pairing
-        vol.Required(CONF_WEBSOCKET_PORT, default=4444): int,  # WebSocket port for notifications
-    },
-)
+CONF_REPAIR = "repair"
+DEFAULT_RPC_PORT = 2223
+DEFAULT_WS_PORT = 4445
 
-
-async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> None:
-    """Validate the user input allows us to connect.
-
-    Args:
-        hass: Home Assistant instance.
-        data: User input data with keys from DATA_SCHEMA.
-
-    Raises:
-        InvalidHost: If the hostname format is invalid.
-        CannotConnect: If connection to the device fails.
-    """
-    # Validate the data can be used to set up a connection.
-    pattern: str = r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.[A-Za-z0-9-]{1,63})*$"
-    if not re.match(pattern, data[CONF_HOST]):
-        raise InvalidHost
-
-    hub: MaveoBox = MaveoBox(hass, data[CONF_HOST], data[CONF_PORT])
-    success: bool = await hub.test_connection()
-    if not success:
-        # If there is an error, raise an exception to notify HA that there was a
-        # problem. The UI will also show there was a problem.
-        raise CannotConnect
 
 async def _get_ports_from_xml(host: str) -> tuple[int, int]:
     """Fetch JSON-RPC and WebSocket ports from server.xml on port 80."""
-    import aiohttp
-    import xml.etree.ElementTree as ET
-
-    rpc_port = 2223   # fallback
-    ws_port = 4445    # fallback
+    rpc_port = DEFAULT_RPC_PORT
+    ws_port = DEFAULT_WS_PORT
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 f"http://{host}/server.xml",
-                timeout=aiohttp.ClientTimeout(total=5)
+                timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 content = await resp.text()
 
@@ -86,6 +58,49 @@ async def _get_ports_from_xml(host: str) -> tuple[int, int]:
     _LOGGER.info("Ports from server.xml — RPC: %s, WS: %s", rpc_port, ws_port)
     return rpc_port, ws_port
 
+
+def _ports_schema(rpc_port: int = DEFAULT_RPC_PORT, ws_port: int = DEFAULT_WS_PORT) -> vol.Schema:
+    """Build a schema for the ports confirmation form."""
+    return vol.Schema(
+        {
+            vol.Required(CONF_PORT, default=rpc_port): int,
+            vol.Required(CONF_WEBSOCKET_PORT, default=ws_port): int,
+        }
+    )
+
+
+def _reconfigure_schema(rpc_port: int, ws_port: int) -> vol.Schema:
+    """Build a schema for the reconfigure form including re-pair checkbox."""
+    return vol.Schema(
+        {
+            vol.Required(CONF_PORT, default=rpc_port): int,
+            vol.Required(CONF_WEBSOCKET_PORT, default=ws_port): int,
+            vol.Required(CONF_REPAIR, default=False): bool,
+        }
+    )
+
+
+async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> None:
+    """Validate the user input allows us to connect.
+
+    Args:
+        hass: Home Assistant instance.
+        data: User input data with host and port.
+
+    Raises:
+        InvalidHost: If the hostname format is invalid.
+        CannotConnect: If connection to the device fails.
+    """
+    pattern: str = r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.[A-Za-z0-9-]{1,63})*$"
+    if not re.match(pattern, data[CONF_HOST]):
+        raise InvalidHost
+
+    hub: MaveoBox = MaveoBox(hass, data[CONF_HOST], data[CONF_PORT])
+    success: bool = await hub.test_connection()
+    if not success:
+        raise CannotConnect
+
+
 class NymeaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a nymea config flow."""
 
@@ -96,36 +111,31 @@ class NymeaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self.data: dict[str, Any] = {}
         self.discovery_info: zeroconf.ZeroconfServiceInfo | None = None
 
+    # ------------------------------------------------------------------
+    # Auto-discovery path (mDNS/zeroconf)
+    # ------------------------------------------------------------------
+
     async def async_step_zeroconf(
         self, discovery_info: zeroconf.ZeroconfServiceInfo
     ) -> ConfigFlowResult:
-        """Handle zeroconf discovery.
-
-        Args:
-            discovery_info: Zeroconf service discovery information.
-
-        Returns:
-            ConfigFlowResult with next step or abort reason.
-        """
+        """Handle zeroconf discovery."""
         _LOGGER.debug("Zeroconf discovery: %s", discovery_info)
 
         # We only want to handle JSON-RPC TCP discoveries, not WebSocket.
-        # WebSocket is used for notifications, but pairing requires JSON-RPC.
         if "_ws._tcp" in discovery_info.type:
             _LOGGER.debug("Ignoring WebSocket discovery, we need JSON-RPC TCP")
             return self.async_abort(reason="not_supported")
 
         host = discovery_info.host
-        # port = discovery_info.port or 2223  # Use JSON-RPC port by default.
-        # websocket_port = 4444  # WebSocket port for notifications.
-        port, websocket_port = await _get_ports_from_xml(host)
 
         # Check if already configured.
         await self.async_set_unique_id(discovery_info.hostname.replace(".local.", ""))
         self._abort_if_unique_id_configured(updates={CONF_HOST: host})
 
-        # Store discovery info for later use.
         self.discovery_info = discovery_info
+
+        # Fetch ports from server.xml.
+        port, websocket_port = await _get_ports_from_xml(host)
 
         # Validate connection.
         try:
@@ -133,70 +143,103 @@ class NymeaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         except (CannotConnect, InvalidHost):
             return self.async_abort(reason="cannot_connect")
 
-        # Store the discovered data.
         self.data = {CONF_HOST: host, CONF_PORT: port, CONF_WEBSOCKET_PORT: websocket_port}
         _LOGGER.info("Discovered nymea device at %s:%s", host, port)
 
-        # Show confirmation form with discovered host.
         self.context["title_placeholders"] = {"name": f"nymea ({host})"}
         return await self.async_step_zeroconf_confirm()
 
     async def async_step_zeroconf_confirm(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Confirm discovery."""
-        _LOGGER.debug("Zeroconf confirm step, user_input: %s", user_input)
+        """Show pre-populated editable form for the user to confirm discovered ports."""
         if user_input is None:
             return self.async_show_form(
                 step_id="zeroconf_confirm",
+                data_schema=_ports_schema(
+                    rpc_port=self.data.get(CONF_PORT, DEFAULT_RPC_PORT),
+                    ws_port=self.data.get(CONF_WEBSOCKET_PORT, DEFAULT_WS_PORT),
+                ),
                 description_placeholders={"host": self.data.get(CONF_HOST, "unknown")},
             )
 
-        # User confirmed, proceed to link step
-        _LOGGER.debug("User confirmed discovery, proceeding to link")
+        # User confirmed (possibly with edits) — update stored data.
+        self.data.update(user_input)
         return await self.async_step_link()
 
+    # ------------------------------------------------------------------
+    # Manual setup path
+    # ------------------------------------------------------------------
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle the initial step."""
-        _LOGGER.debug("User config step, user_input: %s", user_input)
+        """Step 1 of manual setup: enter the host address."""
         errors = {}
-        if user_input is not None:
-            try:
-                await validate_input(self.hass, user_input)
-                self.data = user_input
-                _LOGGER.info("Manual configuration validated for %s:%s", user_input[CONF_HOST], user_input[CONF_PORT])
-                return await self.async_step_link()
-            except CannotConnect:
-                errors["base"] = "cannot_connect"
-            except InvalidHost:
-                errors["host"] = "cannot_connect"
-            except Exception:  # pylint: disable=broad-except
-                _LOGGER.exception("Unexpected exception")
-                errors["base"] = "unknown"
 
-        # If there is no user input or there were errors, show the form again, including any errors that were found with the input.
+        if user_input is not None:
+            host = user_input[CONF_HOST]
+            pattern: str = r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.[A-Za-z0-9-]{1,63})*$"
+            if not re.match(pattern, host):
+                errors[CONF_HOST] = "cannot_connect"
+            else:
+                self.data[CONF_HOST] = host
+                return await self.async_step_ports()
+
         return self.async_show_form(
-            step_id="user", data_schema=DATA_SCHEMA, errors=errors
+            step_id="user",
+            data_schema=vol.Schema({vol.Required(CONF_HOST): str}),
+            errors=errors,
         )
+
+    async def async_step_ports(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Step 2 of manual setup: confirm ports pre-populated from server.xml."""
+        host = self.data[CONF_HOST]
+        errors = {}
+
+        if user_input is None:
+            rpc_port, ws_port = await _get_ports_from_xml(host)
+            return self.async_show_form(
+                step_id="ports",
+                data_schema=_ports_schema(rpc_port=rpc_port, ws_port=ws_port),
+                description_placeholders={"host": host},
+            )
+
+        # Validate connection with the confirmed ports.
+        try:
+            await validate_input(self.hass, {CONF_HOST: host, **user_input})
+        except CannotConnect:
+            errors["base"] = "cannot_connect"
+            rpc_port, ws_port = await _get_ports_from_xml(host)
+            return self.async_show_form(
+                step_id="ports",
+                data_schema=_ports_schema(rpc_port=rpc_port, ws_port=ws_port),
+                errors=errors,
+                description_placeholders={"host": host},
+            )
+
+        self.data.update(user_input)
+        return await self.async_step_link()
+
+    # ------------------------------------------------------------------
+    # Shared link (button press) step
+    # ------------------------------------------------------------------
 
     async def async_step_link(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Attempt to link with the nymea bridge.
-
-        Given a configured host, will ask the user to press the link button
-        to connect to the bridge.
-        """
-        # Show form if no input provided yet (first time showing the form)
+        """Ask the user to press the button on the maveo box to pair."""
         if user_input is None:
             _LOGGER.debug("Showing link form")
             return self.async_show_form(step_id="link")
 
-        # User confirmed (submitted form, even if empty dict), proceed with pairing
-        _LOGGER.info("Starting pairing process for %s:%s", self.data.get(CONF_HOST), self.data.get(CONF_PORT))
+        _LOGGER.info(
+            "Starting pairing process for %s:%s",
+            self.data.get(CONF_HOST),
+            self.data.get(CONF_PORT),
+        )
 
         if not self.data or CONF_HOST not in self.data:
             _LOGGER.error("Configuration data missing in link step: %s", self.data)
@@ -206,13 +249,48 @@ class NymeaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self.hass,
             self.data[CONF_HOST],
             self.data[CONF_PORT],
-            websocket_port=self.data.get(CONF_WEBSOCKET_PORT, 4444)
+            websocket_port=self.data.get(CONF_WEBSOCKET_PORT, DEFAULT_WS_PORT),
         )
         token: str | None = await box.init_connection()
         self.data[CONF_TOKEN] = token
 
         return self.async_create_entry(
             title=f"nymea({self.data[CONF_HOST]})", data=self.data
+        )
+
+    # ------------------------------------------------------------------
+    # Reconfigure path
+    # ------------------------------------------------------------------
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Allow the user to reconfigure ports and optionally re-pair."""
+        entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
+        current_host = entry.data.get(CONF_HOST, "")
+
+        if user_input is None:
+            # Pre-populate from server.xml.
+            rpc_port, ws_port = await _get_ports_from_xml(current_host)
+            return self.async_show_form(
+                step_id="reconfigure",
+                data_schema=_reconfigure_schema(rpc_port=rpc_port, ws_port=ws_port),
+                description_placeholders={"host": current_host},
+            )
+
+        repair = user_input.pop(CONF_REPAIR, False)
+
+        # Keep existing host and token, update ports.
+        self.data = {**entry.data, **user_input}
+
+        if repair:
+            # Go through button press flow to get a new token.
+            return await self.async_step_link()
+
+        # Just update the config entry and reload.
+        return self.async_update_reload_and_abort(
+            entry,
+            data=self.data,
         )
 
 
