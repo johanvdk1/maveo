@@ -50,6 +50,41 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> None:
         # problem. The UI will also show there was a problem.
         raise CannotConnect
 
+async def _get_ports_from_xml(host: str) -> tuple[int, int]:
+    """Fetch JSON-RPC and WebSocket ports from server.xml on port 80."""
+    import aiohttp
+    import xml.etree.ElementTree as ET
+
+    rpc_port = 2223   # fallback
+    ws_port = 4445    # fallback
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"http://{host}/server.xml",
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                content = await resp.text()
+
+        root = ET.fromstring(content)
+        ns = {"upnp": "urn:schemas-upnp-org:device-1-0"}
+
+        for service in root.findall(".//upnp:service", ns):
+            stype = service.find("upnp:serviceType", ns)
+            scpd = service.find("upnp:SCPDURL", ns)
+            if stype is None or scpd is None:
+                continue
+            port = int(scpd.text.split(":")[-1])
+            if "service:ws:1" in stype.text:
+                ws_port = port
+            elif "service:nymeas:1" in stype.text:
+                rpc_port = port
+
+    except Exception as err:
+        _LOGGER.warning("Could not fetch server.xml, using defaults: %s", err)
+
+    _LOGGER.info("Ports from server.xml — RPC: %s, WS: %s", rpc_port, ws_port)
+    return rpc_port, ws_port
 
 class NymeaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a nymea config flow."""
@@ -81,8 +116,9 @@ class NymeaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return self.async_abort(reason="not_supported")
 
         host = discovery_info.host
-        port = discovery_info.port or 2223  # Use JSON-RPC port by default.
-        websocket_port = 4444  # WebSocket port for notifications.
+        # port = discovery_info.port or 2223  # Use JSON-RPC port by default.
+        # websocket_port = 4444  # WebSocket port for notifications.
+        port, websocket_port = await _get_ports_from_xml(host)
 
         # Check if already configured.
         await self.async_set_unique_id(discovery_info.hostname.replace(".local.", ""))
